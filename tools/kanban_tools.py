@@ -973,29 +973,70 @@ def _handle_comment(args: dict, **kw) -> str:
         return _ok(task_id=tid, comment_id=cid)
 
 
-def _store_attachment(board, tid, filename, data, content_type) -> str:
-    """Store via ``kanban_db.store_attachment_bytes`` (shared size cap, per-task
-    dir, metadata row) so agent, dashboard, and CLI surfaces stay in lockstep."""
+def _store_attachment(board, tid, filename, data, content_type, args: dict) -> str:
+    """Verify, then store via ``kanban_db.store_attachment_bytes`` (shared size cap, per-task
+    dir, metadata row) so agent, dashboard, and CLI surfaces stay in lockstep. Verification
+    (caller's expected sha256/size, zip/gzip self-test) raises before anything is written."""
+    from tools.kanban_attach_integrity import verify_attachment
+    digest = verify_attachment(
+        data, str(filename), content_type,
+        expected_sha256=args.get("expected_sha256"), expected_size=args.get("expected_size"))
     with _board(board) as (kb, conn):
         att_id = kb.store_attachment_bytes(
             conn, tid, str(filename), data,
             content_type=content_type, uploaded_by="agent", board=board)
-        return _ok(task_id=tid, attachment_id=att_id, size=len(data))
+        return _ok(task_id=tid, attachment_id=att_id, size=len(data), sha256=digest)
+
+
+def _read_attach_path(raw: str) -> bytes:
+    """Bytes of a local file for ``kanban_attach(path=...)``: absolute, a regular file, not a
+    denied Hermes credential/cache path (same rule as read_file), within the shared cap."""
+    from pathlib import Path
+    from agent.file_safety import get_read_block_error
+    from hermes_cli import kanban_db as kb
+    src = Path(raw).expanduser()
+    # The tool runs in the agent process, not the terminal session, so a relative path
+    # would silently resolve against the wrong directory.
+    _check(src.is_absolute(), f"path must be absolute (got {raw!r})")
+    blocked = get_read_block_error(str(src))
+    if blocked:
+        raise _Reject(blocked)
+    _check(src.is_file(), f"no such regular file: {src}")
+    if src.stat().st_size > kb.KANBAN_ATTACHMENT_MAX_BYTES:
+        raise kb.AttachmentTooLarge(
+            f"attachment exceeds {kb.KANBAN_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB limit")
+    return src.read_bytes()
+
+
+def _decode_attach_b64(content_b64: Any) -> bytes:
+    import base64
+    import binascii
+    try:
+        return base64.b64decode(str(content_b64), validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise _Reject(f"content_base64 is not valid base64: {e}")
 
 
 @_kanban_handler("kanban_attach")
 def _handle_attach(args: dict, **kw) -> str:
-    """Attach an inline (base64) file to a task."""
+    """Attach a local file (``path``, read server-side) or inline base64 bytes to a task.
+    ``path`` exists because base64 relayed through a model can be silently mis-transcribed."""
+    import mimetypes
+    from pathlib import Path
     tid = _worker_guard("kanban_attach", args)
-    filename = _require_text(args, "filename")
-    content_b64 = _require_text(args, "content_base64")
-    import base64
-    import binascii
-    try:
-        data = base64.b64decode(str(content_b64), validate=True)
-    except (binascii.Error, ValueError) as e:
-        raise _Reject(f"content_base64 is not valid base64: {e}")
-    return _store_attachment(args.get("board"), tid, filename, data, args.get("content_type"))
+    path, content_b64 = args.get("path"), args.get("content_base64")
+    has_path = bool(path and str(path).strip())
+    _check(has_path != bool(content_b64 and str(content_b64).strip()),
+           "pass exactly one of path (a local file; preferred) or content_base64")
+    if has_path:
+        data = _read_attach_path(str(path).strip())
+        filename = args.get("filename") or Path(str(path).strip()).expanduser().name
+        content_type = args.get("content_type") or mimetypes.guess_type(str(filename))[0]
+    else:
+        data = _decode_attach_b64(content_b64)
+        filename = _require_text(args, "filename", "filename is required with content_base64")
+        content_type = args.get("content_type")
+    return _store_attachment(args.get("board"), tid, filename, data, content_type, args)
 
 
 _MAX_ATTACH_URL_REDIRECTS = 5
@@ -1058,7 +1099,7 @@ def _handle_attach_url(args: dict, **kw) -> str:
         logger.exception("kanban_attach_url download failed")
         return tool_error(f"kanban_attach_url: failed to fetch {url}: {e}")
     return _store_attachment(
-        args.get("board"), tid, filename, data, args.get("content_type") or fetched_ct)
+        args.get("board"), tid, filename, data, args.get("content_type") or fetched_ct, args)
 
 
 @_kanban_handler("kanban_attachments")
